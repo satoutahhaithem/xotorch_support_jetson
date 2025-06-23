@@ -338,8 +338,14 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         self.state.tokens = input_tensor.clone()
 
       try:
-        # Use torch.cuda.amp for mixed precision if available
-        with torch.cuda.amp.autocast(enabled=self.device.type == 'cuda') if hasattr(torch.cuda, 'amp') else contextlib.nullcontext():
+        # Use torch.amp for mixed precision if available
+        amp_context = contextlib.nullcontext()
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+            # Use the model's dtype to avoid dtype mismatches
+            dtype = self.model_config.get("torch_dtype", torch.float32)
+            amp_context = torch.amp.autocast(device_type=self.device.type, dtype=dtype)
+        
+        with amp_context:
           in_tokens = self.state.tokens.clone()
           in_input_pos = self.state.input_pos.clone()
           in_mask = self.state.mask.clone()
@@ -510,8 +516,12 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         
         # Enable CUDA graph capture for repeated operations if available
         if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
-          if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
-            torch.cuda.amp.autocast(enabled=True)
+          # Use torch.amp instead of torch.cuda.amp (which is deprecated)
+          if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+            # Get the model's dtype to avoid dtype mismatches
+            dtype = self.model_config.get("torch_dtype", torch.float32)
+            # Don't enable by default, let the context manager handle it
+            # This avoids the deprecation warning
     
     await asyncio.get_running_loop().run_in_executor(
       self.executor,
