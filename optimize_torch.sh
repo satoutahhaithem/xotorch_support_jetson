@@ -70,22 +70,25 @@ cat > ~/.xotorch_torch_config << EOF
 # XOTorch optimized configuration for PyTorch
 TORCH_USE_CACHE=true
 TOKENIZERS_PARALLELISM=true
-# Use max-autotune for better runtime performance
-TORCH_COMPILE_MODE=max-autotune
-TORCH_USE_COMPILE=true
-TORCH_USE_FLASH_ATTENTION=true
-# Increase batch size for better GPU utilization
-TORCH_BATCH_SIZE=4
-# Increase prefetch size for better pipelining
-TORCH_PREFETCH_SIZE=8
-# Optimize memory allocation
-PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256,garbage_collection_threshold:0.6
+# Disable compilation to avoid BF16 issues
+TORCH_USE_COMPILE=false
+TORCH_USE_FLASH_ATTENTION=false
+# Use smaller batch size for stability
+TORCH_BATCH_SIZE=1
+# Use moderate prefetch size
+TORCH_PREFETCH_SIZE=2
+# Basic memory allocation settings
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8
 # Force FP16 precision since BF16 is not supported on Quadro RTX 6000
 TORCH_FORCE_FP16=true
-# Optimize thread pool for GPU operations
-TORCH_THREAD_POOL_SIZE=16
-# Enable CUDA kernel fusion
-TORCH_CUDNN_BENCHMARK=true
+# Use moderate thread pool size
+TORCH_THREAD_POOL_SIZE=8
+# Disable CUDA kernel fusion for stability
+TORCH_CUDNN_BENCHMARK=false
+# Disable autocast to avoid BF16 issues
+TORCH_DISABLE_AUTOCAST=true
+# Set default dtype to float16
+TORCH_DEFAULT_DTYPE=float16
 EOF
 
 echo "Adding configuration to .bashrc for automatic loading..."

@@ -45,7 +45,7 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.sharded_model = None
     self.request_id = None
     
-    # Optimize thread pool size for better parallelism
+    # Set thread pool size
     thread_pool_size = int(os.getenv("TORCH_THREAD_POOL_SIZE", str(os.cpu_count() or 4)))
     self.executor = ThreadPoolExecutor(max_workers=thread_pool_size)
     
@@ -55,22 +55,30 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.state = None
     self.oom_cnt = 0
 
-    # Enhanced cache settings
+    # Cache settings
     self.use_cache = bool(os.getenv("TORCH_USE_CACHE", "True").lower() == "true")
     self.cache_setup = False
     
-    # Performance optimization settings
-    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "4"))
-    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "8"))
-    self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "True").lower() == "true")
-    self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "True").lower() == "true")
-    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
+    # Performance settings
+    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
+    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "2"))
+    self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "False").lower() == "true")
+    self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "False").lower() == "true")
+    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
     
     # Force FP16 precision for GPUs that don't support BF16 natively
-    self.force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "False").lower() == "true")
+    self.force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "True").lower() == "true")
     
-    # Enable CUDA benchmark for kernel optimization
-    if os.getenv("TORCH_CUDNN_BENCHMARK", "True").lower() == "true":
+    # Disable autocast to avoid BF16 issues
+    self.disable_autocast = bool(os.getenv("TORCH_DISABLE_AUTOCAST", "False").lower() == "true")
+    
+    # Set default dtype if specified
+    default_dtype_str = os.getenv("TORCH_DEFAULT_DTYPE", "")
+    if default_dtype_str.lower() == "float16":
+        torch.set_default_dtype(torch.float16)
+    
+    # CUDA settings
+    if os.getenv("TORCH_CUDNN_BENCHMARK", "False").lower() == "true":
       torch.backends.cudnn.benchmark = True
 
     # device settings
@@ -242,93 +250,41 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         logits = torch.tensor(x).to(self.device)
 
     def sample_wrapper():
-      # Use CUDA graphs for repeated sampling operations if available
-      use_cuda_graph = (self.device.type == 'cuda' and
-                        hasattr(torch.cuda, 'CUDAGraph') and
-                        x.shape == getattr(self, '_last_sample_shape', None))
-      
-      # Initialize variables for CUDA graph
-      static_input = False
-      graph = None
-      
-      # Try to use CUDA graph for better performance
-      if use_cuda_graph:
-        static_input = True
-        # Create a new graph if we don't have one yet
-        if not hasattr(self, '_sample_graph'):
-          try:
-            # Create a stream specifically for the graph
-            if not hasattr(self, '_graph_stream'):
-              self._graph_stream = torch.cuda.Stream()
-            
-            # Use the dedicated stream for graph capture
-            with torch.cuda.stream(self._graph_stream):
-              # Pre-allocate tensors for graph capture
-              self._logits_clone = logits.clone()
-              self._q_tensor = torch.empty(
-                (logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
-                device=logits.device,
-                dtype=torch.float32  # Keep q as float32 for numerical stability
-              )
-              
-              # Create and capture the graph
-              self._sample_graph = torch.cuda.CUDAGraph()
-              with torch.cuda.graph(self._sample_graph):
-                # Generate random values
-                self._q_tensor.exponential_(1, generator=self.rng)
-                # Sample tokens
-                self._sample_output = ttg.sample(
-                  self._logits_clone,
-                  temperature=temp,
-                  top_k=top_k,
-                  q=self._q_tensor
-                )
-              
-              # Store the graph for reuse
-              graph = self._sample_graph
-              
-              if DEBUG >= 3:
-                print("CUDA graph captured successfully for sampling")
-          except Exception as e:
-            if DEBUG >= 2:
-              print(f"CUDA graph capture failed: {e}")
-            static_input = False
-            # Clean up failed graph attempt
-            if hasattr(self, '_sample_graph'):
-              del self._sample_graph
-        else:
-          # We already have a graph, use it
-          graph = self._sample_graph
-      
-      # Execute the sampling operation
-      if static_input and graph is not None:
-        # Update the input tensor with current logits
-        self._logits_clone.copy_(logits)
-        
-        # Reuse captured graph for better performance
-        with torch.cuda.stream(self._graph_stream):
-          graph.replay()
-          # Wait for the graph to complete
-          self._graph_stream.synchronize()
-        
-        # Get the result
-        tokens = self._sample_output
-      else:
-        # Standard sampling path when graph is not available
+      # Simple sampling implementation without CUDA graphs
+      # This avoids potential issues with graph capture
+      try:
+        # Create random tensor for sampling
         q = torch.empty(
           (logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
           device=logits.device
         ).exponential_(1, generator=self.rng)
         
+        # Ensure q has the right dtype
+        if self.force_fp16 and self.device.type == 'cuda' and q.dtype != torch.float16:
+          q = q.to(dtype=torch.float16)
+        
+        # Sample tokens
         tokens = ttg.sample(logits, temperature=temp, top_k=top_k, q=q)
         
-        # Store shape for future optimizations
-        self._last_sample_shape = x.shape
-      
-      if DEBUG >= 4:
-        print(f"tokens: {tokens}")
-
-      return tokens.numpy(force=True)
+        if DEBUG >= 4:
+          print(f"tokens: {tokens}")
+        
+        # Convert to float32 for numpy export
+        return tokens.float().numpy(force=True)
+      except Exception as e:
+        # Fallback to CPU if CUDA sampling fails
+        if DEBUG >= 2:
+          print(f"CUDA sampling failed: {e}, falling back to CPU")
+        
+        # Move tensors to CPU and try again
+        cpu_logits = logits.cpu()
+        cpu_q = torch.empty(
+          (cpu_logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings)
+        ).exponential_(1, generator=torch.Generator())
+        
+        tokens = ttg.sample(cpu_logits, temperature=temp, top_k=top_k, q=cpu_q)
+        
+        return tokens.numpy(force=True)
 
     return await asyncio.get_running_loop().run_in_executor(self.executor, functools.partial(sample_wrapper))
 
@@ -357,15 +313,21 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     hidden_state = None
     input_tensor = None
     if input_data.ndim == 3:
-      hidden_state = torch.tensor(input_data).to(
-        device=self.device,
-        dtype=self.model_config["torch_dtype"]
-      )
+      # For hidden states, ensure we use the right dtype
+      if self.force_fp16 and self.device.type == 'cuda':
+        # Force FP16 for hidden states
+        hidden_state = torch.tensor(input_data, dtype=torch.float16).to(self.device)
+        if DEBUG >= 3:
+          print(f"Using FP16 for hidden states")
+      else:
+        # Use model's dtype
+        hidden_state = torch.tensor(input_data).to(
+          device=self.device,
+          dtype=self.model_config["torch_dtype"]
+        )
     elif input_data.ndim == 2:
-      input_tensor = torch.tensor(input_data).to(
-        device=self.device,
-        dtype=torch.int
-      )
+      # For token IDs, always use int dtype
+      input_tensor = torch.tensor(input_data, dtype=torch.int).to(self.device)
 
       # possible issue 10 fix
       # if input_tensor.size(-1) > 1:
@@ -403,22 +365,20 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         self.state.tokens = input_tensor.clone()
 
       try:
-        # Use torch.amp for mixed precision if available
+        # Determine if we should use autocast
         amp_context = contextlib.nullcontext()
-        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            # Determine the appropriate dtype based on hardware capabilities
+        if not self.disable_autocast and hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+            # Always use FP16 for CUDA devices when force_fp16 is enabled
             if self.force_fp16 and self.device.type == 'cuda':
-                # Force FP16 for GPUs that don't support BF16 natively
                 dtype = torch.float16
+                if DEBUG >= 2:
+                    print(f"Forcing FP16 precision for CUDA operations")
             else:
                 # Use the model's dtype as default
                 dtype = self.model_config.get("torch_dtype", torch.float32)
-                
+            
             # Create the autocast context with the appropriate dtype
             amp_context = torch.amp.autocast(device_type=self.device.type, dtype=dtype)
-            
-            if DEBUG >= 2:
-                print(f"Using mixed precision with dtype: {dtype}")
         
         with amp_context:
           in_tokens = self.state.tokens.clone()
@@ -553,13 +513,11 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         raise
 
       if model_hs is not None:
-        # Handle different dtypes properly
-        if model_hs.dtype == torch.bfloat16 or (self.force_fp16 and model_hs.dtype != torch.float16):
-          # Convert to appropriate dtype for numpy export
-          if self.force_fp16:
-            model_hs = model_hs.to(dtype=torch.float16)
-          else:
-            model_hs = model_hs.float()
+        # Always convert to float32 for numpy export to avoid dtype issues
+        if model_hs.dtype == torch.bfloat16:
+          model_hs = model_hs.float()
+        elif self.force_fp16 and model_hs.dtype != torch.float16 and self.device.type == 'cuda':
+          model_hs = model_hs.to(dtype=torch.float16)
 
         if DEBUG >= 4:
           print("sending hidden states")
@@ -568,8 +526,9 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
           print(f"state.input_pos: {self.state.input_pos.size()}")
           print(f"state.mask: {self.state.mask.size()}")
         
+        # Convert to float32 for numpy export
         return (
-          model_hs.numpy(force=True),
+          model_hs.float().numpy(force=True),
           self.state.to_dict(),
         )
       
@@ -578,17 +537,15 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       else:
         self.state.curr_pos += 1
 
-      # Handle different dtypes properly
-      if model_logits.dtype == torch.bfloat16 or (self.force_fp16 and model_logits.dtype != torch.float16):
-        # Convert to appropriate dtype for numpy export
-        if self.force_fp16:
-          model_logits = model_logits.to(dtype=torch.float16)
-        else:
-          model_logits = model_logits.float()
+      # Always convert to float32 for numpy export to avoid dtype issues
+      if model_logits.dtype == torch.bfloat16:
+        model_logits = model_logits.float()
+      elif self.force_fp16 and model_logits.dtype != torch.float16 and self.device.type == 'cuda':
+        model_logits = model_logits.to(dtype=torch.float16)
       
-      # Always ensure we have a proper dtype for numpy export
+      # Always convert to float32 for numpy export
       return (
-        model_logits[:, -1].numpy(force=True),
+        model_logits[:, -1].float().numpy(force=True),
         self.state.to_dict(),
       )
 
