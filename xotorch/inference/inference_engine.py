@@ -53,7 +53,8 @@ class InferenceEngine(ABC):
 
 inference_engine_classes = {
   "dummy": "DummyInferenceEngine",
-  "torch": "TorchDynamicShardInferenceEngine"
+  "torch": "TorchDynamicShardInferenceEngine",
+  "tensorrt": "TensorRTLLMInferenceEngine"
 }
 
 
@@ -64,6 +65,18 @@ def get_inference_engine(inference_engine_name: str, shard_downloader: ShardDown
     from xotorch.inference.torch.sharded_inference_engine import TorchDynamicShardInferenceEngine
 
     return TorchDynamicShardInferenceEngine(shard_downloader)
+  elif inference_engine_name == "tensorrt":
+    try:
+      from xotorch.inference.torch.tensorrt_llm_inference_engine import TensorRTLLMInferenceEngine, TENSORRT_LLM_AVAILABLE
+      if not TENSORRT_LLM_AVAILABLE:
+        print("TensorRT-LLM not available. Falling back to standard PyTorch engine.")
+        from xotorch.inference.torch.sharded_inference_engine import TorchDynamicShardInferenceEngine
+        return TorchDynamicShardInferenceEngine(shard_downloader)
+      return TensorRTLLMInferenceEngine(shard_downloader)
+    except ImportError as e:
+      print(f"Error loading TensorRT-LLM engine: {e}. Falling back to standard PyTorch engine.")
+      from xotorch.inference.torch.sharded_inference_engine import TorchDynamicShardInferenceEngine
+      return TorchDynamicShardInferenceEngine(shard_downloader)
   elif inference_engine_name == "dummy":
     from xotorch.inference.dummy_inference_engine import DummyInferenceEngine
     return DummyInferenceEngine()

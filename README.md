@@ -39,11 +39,14 @@ After install script, run pytorch install [for your environment](https://pytorch
 
 **FOR NVIDIA JETSON INSTALL SEE [THIS ARTICLE](https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/index.html) FOR PYTORCH INSTALL**
 
+**FOR NVIDIA GPU USERS:** For optimal performance with large language models, you can use the TensorRT-LLM inference engine:
 
 ```
 $ pip install torch torchvision torchaudio
 $ pip install torchtune
 $ pip install torchao
+$ pip install tensorrt-llm
+$ ./optimize_tensorrt_llm.sh  # Run this to optimize your NVIDIA GPU for TensorRT-LLM
 ```
 
 After install, use the **xot** command
@@ -51,6 +54,27 @@ After install, use the **xot** command
 ```
 $ xot
 ```
+
+### Inference Engines
+
+XOTorch supports multiple inference engines:
+
+1. **PyTorch (default)**: Standard PyTorch-based inference
+   ```
+   $ xot --inference-engine torch <model_name>
+   ```
+
+2. **TensorRT-LLM**: Optimized for NVIDIA GPUs with significantly faster inference
+   ```
+   $ xot --inference-engine tensorrt <model_name>
+   ```
+   
+3. **Dummy**: For testing and development
+   ```
+   $ xot --inference-engine dummy <model_name>
+   ```
+
+For NVIDIA GPU users, the TensorRT-LLM engine is recommended for the best performance with large language models. It provides optimized tensor operations, efficient memory management, and hardware-specific optimizations.
 
 ## Background
 

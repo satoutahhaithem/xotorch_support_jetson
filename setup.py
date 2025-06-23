@@ -35,7 +35,7 @@ install_requires = [
 extras_require = {
   "formatting": ["yapf==0.40.2",],
   "windows": ["pywin32==308","winloop==0.1.8"],
-  "nvidia-gpu": ["nvidia-ml-py==12.560.30",],
+  "nvidia-gpu": ["nvidia-ml-py==12.560.30", "tensorrt-llm>=0.9.0"],
   "amd-gpu": ["pyrsmi==0.2.0"],
   "non-windows": ["uvloop==0.21.0"],
   "jetson": ["torchtune>=0.6.1", "torchao>=0.11.0"],
