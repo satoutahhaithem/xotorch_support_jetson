@@ -89,6 +89,8 @@ TORCH_CUDNN_BENCHMARK=false
 TORCH_DISABLE_AUTOCAST=true
 # Set default dtype to float16
 TORCH_DEFAULT_DTYPE=float16
+# Set debug level to 2 to see KV cache patching info
+DEBUG=2
 EOF
 
 echo "Adding configuration to .bashrc for automatic loading..."

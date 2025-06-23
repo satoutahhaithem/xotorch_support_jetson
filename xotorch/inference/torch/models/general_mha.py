@@ -207,37 +207,86 @@ class ShardedGeneralModel(nn.Module):
     """
     import types
     from functools import wraps
+    import inspect
+    
+    # Print debug info
+    if DEBUG >= 2:
+      print("Starting KV cache patching process")
+      print(f"Model dtype: {self.dtype}")
     
     # Find all attention layers with KV cache
+    patched_count = 0
     for name, module in self.model.named_modules():
       if hasattr(module, 'kv_cache') and hasattr(module.kv_cache, 'update'):
+        # Get the original update method
         original_update = module.kv_cache.update
         
+        # Print debug info about the KV cache
+        if DEBUG >= 2:
+          if hasattr(module.kv_cache, 'k_cache'):
+            print(f"KV cache in {name}: k_cache dtype = {module.kv_cache.k_cache.dtype}")
+          if hasattr(module.kv_cache, 'v_cache'):
+            print(f"KV cache in {name}: v_cache dtype = {module.kv_cache.v_cache.dtype}")
+        
         # Create a wrapper that ensures dtype consistency
-        @wraps(original_update)
-        def patched_update(self, k_val, v_val):
-          # Convert inputs to match cache dtype if needed
-          k_cache_dtype = self.k_cache.dtype
-          v_cache_dtype = self.v_cache.dtype
+        def make_patched_update(orig_update):
+          @wraps(orig_update)
+          def patched_update(self, k_val, v_val):
+            # Print debug info
+            if DEBUG >= 3:
+              print(f"KV cache update called with k_val dtype = {k_val.dtype}, v_val dtype = {v_val.dtype}")
+              if hasattr(self, 'k_cache'):
+                print(f"k_cache dtype = {self.k_cache.dtype}")
+              if hasattr(self, 'v_cache'):
+                print(f"v_cache dtype = {self.v_cache.dtype}")
+            
+            # Force conversion to the right dtype
+            if hasattr(self, 'k_cache') and k_val.dtype != self.k_cache.dtype:
+              k_val = k_val.to(dtype=self.k_cache.dtype)
+              if DEBUG >= 2:
+                print(f"Converted k_val to {self.k_cache.dtype}")
+            
+            if hasattr(self, 'v_cache') and v_val.dtype != self.v_cache.dtype:
+              v_val = v_val.to(dtype=self.v_cache.dtype)
+              if DEBUG >= 2:
+                print(f"Converted v_val to {self.v_cache.dtype}")
+            
+            # Call the original update method with dtype-matched tensors
+            try:
+              return orig_update(k_val, v_val)
+            except RuntimeError as e:
+              if "dtype mismatch" in str(e) or "Index put requires the source and destination dtypes match" in str(e):
+                # Last resort: try to convert the cache itself
+                if DEBUG >= 1:
+                  print(f"Runtime error in KV cache update: {e}")
+                  print("Attempting emergency dtype conversion...")
+                
+                # Force convert everything to FP16
+                k_val = k_val.to(dtype=torch.float16)
+                v_val = v_val.to(dtype=torch.float16)
+                
+                if hasattr(self, 'k_cache'):
+                  self.k_cache = self.k_cache.to(dtype=torch.float16)
+                if hasattr(self, 'v_cache'):
+                  self.v_cache = self.v_cache.to(dtype=torch.float16)
+                
+                # Try again with everything in FP16
+                return orig_update(k_val, v_val)
+              else:
+                # Re-raise if it's not a dtype mismatch error
+                raise
           
-          if k_val.dtype != k_cache_dtype:
-            if DEBUG >= 3:
-              print(f"Converting k_val from {k_val.dtype} to {k_cache_dtype}")
-            k_val = k_val.to(dtype=k_cache_dtype)
-            
-          if v_val.dtype != v_cache_dtype:
-            if DEBUG >= 3:
-              print(f"Converting v_val from {v_val.dtype} to {v_cache_dtype}")
-            v_val = v_val.to(dtype=v_cache_dtype)
-            
-          # Call the original update method with dtype-matched tensors
-          return original_update(k_val, v_val)
+          return patched_update
         
         # Replace the original update method with our patched version
-        module.kv_cache.update = types.MethodType(patched_update, module.kv_cache)
+        module.kv_cache.update = types.MethodType(make_patched_update(original_update), module.kv_cache)
+        patched_count += 1
         
-        if DEBUG >= 3:
+        if DEBUG >= 2:
           print(f"Patched KV cache in {name}")
+    
+    if DEBUG >= 1:
+      print(f"Patched {patched_count} KV cache instances")
 
     if DEBUG >= 4:
       print("ShardedGeneralModel called")
