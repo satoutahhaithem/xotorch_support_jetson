@@ -175,6 +175,9 @@ class ShardedGeneralModel(nn.Module):
     self.max_seq_len = self.config["max_seq_len"]
     self.use_cache = use_cache
     
+    # Store max_generated_tokens as a class attribute
+    self.max_generated_tokens = max_generated_tokens
+    
     # Create the model with the determined dtype
     self.model = GeneralMHA(
       config,
