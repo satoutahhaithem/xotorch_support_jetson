@@ -32,7 +32,18 @@ try:
     TENSORRT_LLM_AVAILABLE = True
 except ImportError:
     TENSORRT_LLM_AVAILABLE = False
-    print("TensorRT-LLM not found. Please install it with: pip install tensorrt-llm")
+    print("\n" + "="*80)
+    print("TensorRT-LLM not found. For optimal performance on NVIDIA GPUs, please install it:")
+    print("\n1. From PyPI (if available for your CUDA version):")
+    print("   pip install tensorrt-llm")
+    print("\n2. From NVIDIA's GitHub repository:")
+    print("   git clone https://github.com/NVIDIA/TensorRT-LLM.git")
+    print("   cd TensorRT-LLM")
+    print("   python -m pip install -e .")
+    print("\n3. Using NVIDIA's container:")
+    print("   docker pull nvcr.io/nvidia/tensorrt-llm:latest")
+    print("\nFalling back to standard PyTorch inference engine.")
+    print("="*80 + "\n")
 
 # Default sampling parameters
 TEMP = 0.6
@@ -44,7 +55,13 @@ class TensorRTLLMInferenceEngine(InferenceEngine):
     """
     def __init__(self, shard_downloader: ShardDownloader):
         if not TENSORRT_LLM_AVAILABLE:
-            raise ImportError("TensorRT-LLM is required but not installed. Please install it with: pip install tensorrt-llm")
+            raise ImportError(
+                "TensorRT-LLM is required but not installed. Please install it using one of these methods:\n"
+                "1. From PyPI: pip install tensorrt-llm\n"
+                "2. From GitHub: git clone https://github.com/NVIDIA/TensorRT-LLM.git && cd TensorRT-LLM && python -m pip install -e .\n"
+                "3. Using NVIDIA's container: docker pull nvcr.io/nvidia/tensorrt-llm:latest\n"
+                "\nNote: TensorRT-LLM requires compatible NVIDIA drivers and CUDA toolkit."
+            )
         
         self.shard = None
         self.shard_downloader = shard_downloader
@@ -345,6 +362,8 @@ class TensorRTLLMInferenceEngine(InferenceEngine):
                     max_batch_size=1,
                     max_input_len=self.model_config["max_seq_len"],
                     max_output_len=1024,
+                    # Use optimization level from environment variable or default to 3
+                    optimization_level=int(os.environ.get("TENSORRT_LLM_BUILDER_OPTIMIZATION_LEVEL", "3")),
                 )
                 
                 # Create TensorRT-LLM model

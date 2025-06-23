@@ -12,8 +12,22 @@ fi
 
 # Check if TensorRT-LLM is installed
 if ! pip list | grep -q tensorrt-llm; then
-    echo "TensorRT-LLM is not installed. Installing it now..."
-    pip install tensorrt-llm
+    echo "TensorRT-LLM is not installed."
+    echo "Please install TensorRT-LLM manually using one of these methods:"
+    echo ""
+    echo "1. From PyPI (if available for your CUDA version):"
+    echo "   pip install tensorrt-llm"
+    echo ""
+    echo "2. From NVIDIA's GitHub repository:"
+    echo "   git clone https://github.com/NVIDIA/TensorRT-LLM.git"
+    echo "   cd TensorRT-LLM"
+    echo "   python -m pip install -e ."
+    echo ""
+    echo "3. Using NVIDIA's container:"
+    echo "   docker pull nvcr.io/nvidia/tensorrt-llm:latest"
+    echo ""
+    echo "Note: TensorRT-LLM requires compatible NVIDIA drivers and CUDA toolkit."
+    echo "Continuing with optimization without installing TensorRT-LLM..."
 fi
 
 # Set environment variables for XOTorch with TensorRT-LLM
@@ -75,7 +89,17 @@ fi
 if command -v nvidia-smi &> /dev/null; then
     echo "Setting GPU to maximum performance mode..."
     sudo nvidia-smi -pm 1  # Set persistent mode
-    sudo nvidia-smi -ac $(nvidia-smi -q -d SUPPORTED_CLOCKS | grep -A 1 "Memory" | tail -n 1 | awk '{print $1}'),$(nvidia-smi -q -d SUPPORTED_CLOCKS | grep -A 1 "Graphics" | tail -n 1 | awk '{print $1}')
+    
+    # Get the highest supported memory and graphics clocks
+    MEM_CLOCK=$(nvidia-smi -q -d SUPPORTED_CLOCKS | grep -A 1 "Memory" | tail -n 1 | awk '{print $1}' | tr -d ',')
+    GPU_CLOCK=$(nvidia-smi -q -d SUPPORTED_CLOCKS | grep -A 1 "Graphics" | tail -n 1 | awk '{print $1}' | tr -d ',')
+    
+    if [ ! -z "$MEM_CLOCK" ] && [ ! -z "$GPU_CLOCK" ]; then
+        echo "Setting application clocks to Memory: $MEM_CLOCK MHz, Graphics: $GPU_CLOCK MHz"
+        sudo nvidia-smi -ac $MEM_CLOCK,$GPU_CLOCK
+    else
+        echo "Could not determine supported clock speeds. Skipping clock configuration."
+    fi
 fi
 
 echo "Optimization complete! Please restart your terminal or run 'source ~/.bashrc' to apply changes."
