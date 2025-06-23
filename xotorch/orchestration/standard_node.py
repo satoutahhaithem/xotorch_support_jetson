@@ -4,6 +4,13 @@ import asyncio
 import uuid
 import time
 import traceback
+
+# DIRECT DEBUG OUTPUT - THIS SHOULD ALWAYS PRINT
+print("\n\n")
+print("#"*80)
+print("STANDARD NODE MODULE LOADED")
+print("#"*80)
+print("\n\n")
 from typing import List, Dict, Optional, Tuple, Union, Set
 from xotorch.networking import Discovery, PeerHandle, Server
 from xotorch.inference.inference_engine import InferenceEngine, Shard
@@ -104,15 +111,53 @@ class StandardNode(Node):
     if request_id not in self.buffered_token_output:
       self.buffered_token_output[request_id] = ([], False)
     is_finished = len(self.buffered_token_output[request_id][0]) >= self.max_generate_tokens
+    # DIRECT DEBUG OUTPUT
+    print("\n" + "#"*80)
+    print("PROCESS_INFERENCE_RESULT CALLED:")
+    print(f"Request ID: {request_id}")
+    print(f"Shard: {shard}")
+    print(f"Is Last Layer: {shard.is_last_layer()}")
+    print(f"Is Finished: {is_finished}")
+    print("#"*80 + "\n")
+    
     if shard.is_last_layer() and not is_finished:
+      # Sample a token
       token = await self.inference_engine.sample(result, temp=self.default_sample_temperature)
       await self.inference_engine.ensure_shard(shard)
-      self.buffered_token_output[request_id][0].append(token.item())
-      if DEBUG >= 2: print(f"[{request_id}] result size: {result.size}, is finished: {is_finished}, buffered tokens: {len(self.buffered_token_output[request_id][0])}")
-      is_finished = token.item() == self.inference_engine.tokenizer.eos_token_id
+      
+      # Convert to integer and add to buffer
+      token_value = int(token.item())  # Convert to integer
+      self.buffered_token_output[request_id][0].append(token_value)
+      
+      # DIRECT DEBUG OUTPUT
+      print("\n" + "#"*80)
+      print("TOKEN GENERATED:")
+      print(f"Token Value: {token_value}")
+      print(f"Token Type: {type(token_value)}")
+      print(f"Buffered Tokens: {self.buffered_token_output[request_id][0]}")
+      print(f"Number of Buffered Tokens: {len(self.buffered_token_output[request_id][0])}")
+      print("#"*80 + "\n")
+      
+      # Check if we're finished
+      is_finished = token_value == self.inference_engine.tokenizer.eos_token_id
+      
+      # Prepare for next iteration
       forward = token.reshape(1, -1)
-      self.trigger_on_token_callbacks(request_id, self.buffered_token_output[request_id][0], is_finished)
-      asyncio.create_task(self.broadcast_result(request_id, self.buffered_token_output[request_id][0], is_finished))
+      
+      # Make sure we're passing integers, not floats
+      int_tokens = [int(t) for t in self.buffered_token_output[request_id][0]]
+      
+      # DIRECT DEBUG OUTPUT
+      print("\n" + "#"*80)
+      print("ABOUT TO TRIGGER CALLBACKS:")
+      print(f"Request ID: {request_id}")
+      print(f"Int Tokens: {int_tokens}")
+      print(f"Is Finished: {is_finished}")
+      print("#"*80 + "\n")
+      
+      # Trigger callbacks and broadcast result
+      self.trigger_on_token_callbacks(request_id, int_tokens, is_finished)
+      asyncio.create_task(self.broadcast_result(request_id, int_tokens, is_finished))
     else:
       forward = result
 
@@ -421,8 +466,40 @@ class StandardNode(Node):
     return self._on_opaque_status
 
   def trigger_on_token_callbacks(self, request_id: str, tokens: List[int], is_finished: bool) -> None:
-    if DEBUG >= 2: print(f"Triggering all on_token callbacks with {request_id=} num_tokens={len(tokens)} {is_finished=}")
+    # Write to a file for debugging
+    with open("/tmp/xotorch_tokens.txt", "a") as f:
+      f.write("\n" + "="*80 + "\n")
+      f.write("TOKENS GENERATED:\n")
+      f.write(f"Request ID: {request_id}\n")
+      f.write(f"Tokens: {tokens}\n")
+      f.write(f"Is Finished: {is_finished}\n")
+      f.write(f"Number of registered callbacks: {len(self.on_token.callbacks)}\n")
+      f.write(f"Callback IDs: {list(self.on_token.callbacks.keys())}\n")
+      f.write("="*80 + "\n")
+    
+    # ALWAYS print this information regardless of DEBUG level
+    print("\n" + "="*80)
+    print("TOKENS GENERATED:")
+    print(f"Request ID: {request_id}")
+    print(f"Tokens: {tokens}")
+    print(f"Is Finished: {is_finished}")
+    print(f"Number of registered callbacks: {len(self.on_token.callbacks)}")
+    print(f"Callback IDs: {list(self.on_token.callbacks.keys())}")
+    print("="*80 + "\n")
+    
+    # Trigger the callbacks
     self.on_token.trigger_all(request_id, tokens, is_finished)
+    
+    # Print confirmation
+    print("\n" + "="*80)
+    print("CALLBACKS TRIGGERED")
+    print("="*80 + "\n")
+    
+    # Write to a file for debugging
+    with open("/tmp/xotorch_tokens.txt", "a") as f:
+      f.write("\n" + "="*80 + "\n")
+      f.write("CALLBACKS TRIGGERED\n")
+      f.write("="*80 + "\n")
   
   async def broadcast_result(self, request_id: str, result: List[int], is_finished: bool) -> None:
     async def send_result_to_peer(peer):

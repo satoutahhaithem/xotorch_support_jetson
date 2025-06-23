@@ -62,6 +62,42 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.use_cache = bool(os.getenv("TORCH_USE_CACHE", "True").lower() == "true")
     self.cache_setup = False
     
+    # Performance settings
+    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
+    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "2"))
+    self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "False").lower() == "true")
+    self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "False").lower() == "true")
+    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
+    
+    # Force FP16 precision for GPUs that don't support BF16 natively
+    self.force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "True").lower() == "true")
+    
+    # Disable autocast to avoid BF16 issues
+    self.disable_autocast = bool(os.getenv("TORCH_DISABLE_AUTOCAST", "False").lower() == "true")
+    
+    # Set default dtype if specified
+    default_dtype_str = os.getenv("TORCH_DEFAULT_DTYPE", "")
+    if default_dtype_str.lower() == "float16":
+        torch.set_default_dtype(torch.float16)
+    
+    # CUDA settings
+    if os.getenv("TORCH_CUDNN_BENCHMARK", "False").lower() == "true":
+      torch.backends.cudnn.benchmark = True
+
+    # device settings
+    if os.environ.get("TORCH_DEVICE"):
+      self.device = torch.device(os.environ["TORCH_DEVICE"])
+    elif torch.cuda.is_available():
+      self.device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+      self.device = torch.device("mps")
+    else:
+      self.device = torch.device("cpu")
+
+    # rng setup for sampling
+    self.rng = torch.Generator(device=self.device)
+    self.rng.manual_seed(1234)
+    
   def _apply_global_kv_cache_patch(self):
     """
     Apply a global monkey patch to the torchtune.modules.kv_cache module
@@ -134,42 +170,6 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     except Exception as e:
       if DEBUG >= 1:
         print(f"Error applying global KV cache patch: {e}")
-    
-    # Performance settings
-    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
-    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "2"))
-    self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "False").lower() == "true")
-    self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "False").lower() == "true")
-    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
-    
-    # Force FP16 precision for GPUs that don't support BF16 natively
-    self.force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "True").lower() == "true")
-    
-    # Disable autocast to avoid BF16 issues
-    self.disable_autocast = bool(os.getenv("TORCH_DISABLE_AUTOCAST", "False").lower() == "true")
-    
-    # Set default dtype if specified
-    default_dtype_str = os.getenv("TORCH_DEFAULT_DTYPE", "")
-    if default_dtype_str.lower() == "float16":
-        torch.set_default_dtype(torch.float16)
-    
-    # CUDA settings
-    if os.getenv("TORCH_CUDNN_BENCHMARK", "False").lower() == "true":
-      torch.backends.cudnn.benchmark = True
-
-    # device settings
-    if os.environ.get("TORCH_DEVICE"):
-      self.device = torch.device(os.environ["TORCH_DEVICE"])
-    elif torch.cuda.is_available():
-      self.device = torch.device("cuda")
-    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-      self.device = torch.device("mps")
-    else:
-      self.device = torch.device("cpu")
-
-    # rng setup for sampling
-    self.rng = torch.Generator(device=self.device)
-    self.rng.manual_seed(1234)
 
   def setup_cache(self, batch_size: int=None, total_response_length: int=1024):
     # Use class batch_size if not specified

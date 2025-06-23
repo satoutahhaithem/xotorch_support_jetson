@@ -3,7 +3,16 @@ import asyncio
 import uuid
 import traceback
 
-from xotorch.helpers import is_port_available, find_available_port, DEBUG
+# DIRECT DEBUG OUTPUT - THIS SHOULD ALWAYS PRINT
+print("\n\n")
+print("*"*80)
+print("CHAT TUI MODULE LOADED")
+print("*"*80)
+print("\n\n")
+
+from xotorch.helpers import is_port_available, find_available_port
+# Disable DEBUG flag completely
+DEBUG = 0
 from xotorch.topology.device_capabilities import UNKNOWN_DEVICE_CAPABILITIES
 from xotorch.models import build_base_shard, get_repo
 from xotorch.inference.tokenizers import resolve_tokenizer
@@ -75,6 +84,9 @@ async def run_chat_tui(args, api, node):
       callback_id = f"tui-token-speed-{request_id}"
       callback = node.on_token.register(callback_id)
       
+      # Force print the callback registration
+      print(f"\n*** REGISTERED CALLBACK: {callback_id} ***\n", flush=True)
+      
       # Define token speed tracking callback
       async def track_token_speed():
         nonlocal tokens_per_second, last_token_count
@@ -83,6 +95,15 @@ async def run_chat_tui(args, api, node):
         
         def on_token(_request_id, _tokens, _is_finished):
           nonlocal tokens_per_second, last_token_count, start_time, full_response
+          
+          # FORCE PRINT EVERYTHING
+          print("\n" + "="*50)
+          print(f"TOKEN CALLBACK RECEIVED:")
+          print(f"Request ID: {_request_id}")
+          print(f"Tokens: {_tokens}")
+          print(f"Is Finished: {_is_finished}")
+          print("="*50 + "\n")
+          
           tokens.extend(_tokens)
           
           # Calculate tokens per second
@@ -94,22 +115,43 @@ async def run_chat_tui(args, api, node):
           # Try to decode and display the latest tokens
           try:
             if _tokens:
+              # Convert float tokens to integers if needed
+              int_tokens = [int(t) for t in _tokens]
+              
               tokenizer = node.inference_engine.tokenizer
-              new_text = tokenizer.decode(_tokens)
-              full_response += new_text
+              try:
+                # Force print raw tokens for debugging
+                print(f"\n[TOKENS: {int_tokens}]", flush=True)
+                
+                new_text = tokenizer.decode(int_tokens)
+                
+                # Force print decoded text
+                print(f"\n[TEXT: '{new_text}']", flush=True)
+                
+                # Add to full response
+                full_response += new_text
+              except Exception as e:
+                print(f"\nError decoding tokens: {e}")
+                print(f"Token values: {int_tokens}")
               
-              # Print the new text without creating a new line
-              # print(new_text, end="", flush=True)
-              
-              # Update the stats line occasionally
-              # if len(tokens) % 5 == 0:  # Update every 5 tokens
-              #   tflops = node.topology.nodes.get(node.id, UNKNOWN_DEVICE_CAPABILITIES).flops.fp16
-              #   print(f"\n[Stats: {len(tokens)} tokens | {tokens_per_second:.2f} t/s | {tflops:.2f} TFLOPS]\n", end="", flush=True)
+              # Update the stats line occasionally but only in debug mode
+              if DEBUG and len(tokens) % 10 == 0:  # Update every 10 tokens
+                current_time = time.time()
+                elapsed = current_time - start_time
+                if elapsed > 0:
+                  tokens_per_second = len(tokens) / elapsed
           except Exception as e:
             if DEBUG >= 2:
               print(f"\nError decoding tokens: {e}")
           
-          return _request_id == request_id and _is_finished
+          # Force print when the callback is called
+          print(f"\n*** ON_TOKEN CALLBACK CALLED: {_request_id}, {len(_tokens)} tokens, is_finished={_is_finished} ***\n", flush=True)
+          
+          # Always return False to keep the callback active until we're done
+          if _is_finished:
+            print(f"\n*** FINISHED GENERATING TOKENS ***\n", flush=True)
+            return True
+          return False
         
         try:
           await callback.wait(on_token, timeout=300)
@@ -127,10 +169,31 @@ async def run_chat_tui(args, api, node):
           tflops = node.topology.nodes.get(node.id, UNKNOWN_DEVICE_CAPABILITIES).flops.fp16
           print(f"Final stats: {len(tokens)} tokens | {tokens_per_second:.2f} tokens/sec | {tflops:.2f} TFLOPS\n")
           
-          # Display the full response for clarity
-          print("\n=== AI RESPONSE ===\n")
+          # Write the response to a file for debugging
+          with open("/tmp/xotorch_response.txt", "w") as f:
+            f.write(f"Response length: {len(full_response)} characters\n")
+            f.write(f"Response: {full_response}\n")
+            f.write(f"Character codes: {' '.join([str(ord(c)) for c in full_response[:100]])}\n")
+            f.write(f"Tokens: {tokens}\n")
+          
+          # Display the full response with VERY CLEAR formatting
+          print("\n\n")
+          print("="*80)
+          print("="*30 + " FULL AI RESPONSE " + "="*30)
+          print("="*80)
+          print(f"Response length: {len(full_response)} characters")
+          print("RESPONSE TEXT:")
+          print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
           print(full_response)
-          print("--------------------\n")
+          print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
+          
+          # Print the response with character codes for debugging
+          print("\nRESPONSE CHARACTER CODES:")
+          print(" ".join([f"{ord(c):d}" for c in full_response[:100]]))
+          print("="*80 + "\n")
+          
+          # Print the file location
+          print(f"\nResponse written to /tmp/xotorch_response.txt for debugging\n")
         except Exception as e:
           print(f"\n\nError tracking token speed: {e}")
         finally:
@@ -149,7 +212,14 @@ async def run_chat_tui(args, api, node):
         tokenizer = await resolve_tokenizer(get_repo(shard.model_id, node.inference_engine.__class__.__name__))
         prompt = tokenizer.apply_chat_template([{"role": "user", "content": user_input}], tokenize=False, add_generation_prompt=True)
         
-        await node.process_prompt(shard, prompt, request_id=request_id)
+        # Add direct print statement to show we're about to process the prompt
+        print("\n\nDIRECT DEBUG: About to process prompt with request_id:", request_id)
+        
+        # Process the prompt
+        result = await node.process_prompt(shard, prompt, request_id=request_id)
+        
+        # Add direct print statement to show the result
+        print("\n\nDIRECT DEBUG: Result from process_prompt:", result)
         
         # Wait for token speed tracking to complete
         await token_speed_task

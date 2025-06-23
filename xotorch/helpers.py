@@ -117,10 +117,28 @@ class AsyncCallback(Generic[T]):
     self.observers.append(callback)
 
   def set(self, *args: T) -> None:
+    if DEBUG > 0:
+      print(f"DEBUG: AsyncCallback.set called with args: {args}")
     self.result = args
-    for observer in self.observers:
-      observer(*args)
+    if DEBUG > 0:
+      print(f"DEBUG: Number of observers: {len(self.observers)}")
+    for i, observer in enumerate(self.observers):
+      if DEBUG > 0:
+        print(f"DEBUG: Calling observer {i} with args: {args}")
+      try:
+        observer(*args)
+        if DEBUG > 0:
+          print(f"DEBUG: Observer {i} called successfully")
+      except Exception as e:
+        if DEBUG > 0:
+          print(f"DEBUG: Error calling observer {i}: {e}")
+          import traceback
+          traceback.print_exc()
+    if DEBUG > 0:
+      print(f"DEBUG: Creating notify task")
     asyncio.create_task(self.notify())
+    if DEBUG > 0:
+      print(f"DEBUG: AsyncCallback.set completed")
 
   async def notify(self) -> None:
     async with self.condition:
@@ -145,8 +163,15 @@ class AsyncCallbackSystem(Generic[K, T]):
       self.callbacks[name].set(*args)
 
   def trigger_all(self, *args: T) -> None:
-    for callback in self.callbacks.values():
+    if DEBUG > 0:
+      print(f"DEBUG: AsyncCallbackSystem.trigger_all called with args: {args}")
+      print(f"DEBUG: Number of callbacks: {len(self.callbacks)}")
+    for name, callback in self.callbacks.items():
+      if DEBUG > 0:
+        print(f"DEBUG: Setting callback '{name}' with args: {args}")
       callback.set(*args)
+    if DEBUG > 0:
+      print(f"DEBUG: AsyncCallbackSystem.trigger_all completed")
 
 
 K = TypeVar('K', bound=str)
