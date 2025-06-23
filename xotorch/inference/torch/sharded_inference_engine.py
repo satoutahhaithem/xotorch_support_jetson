@@ -45,6 +45,9 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.sharded_model = None
     self.request_id = None
     
+    # Apply global monkey patch for KV cache
+    self._apply_global_kv_cache_patch()
+    
     # Set thread pool size
     thread_pool_size = int(os.getenv("TORCH_THREAD_POOL_SIZE", str(os.cpu_count() or 4)))
     self.executor = ThreadPoolExecutor(max_workers=thread_pool_size)
@@ -58,6 +61,79 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     # Cache settings
     self.use_cache = bool(os.getenv("TORCH_USE_CACHE", "True").lower() == "true")
     self.cache_setup = False
+    
+  def _apply_global_kv_cache_patch(self):
+    """
+    Apply a global monkey patch to the torchtune.modules.kv_cache module
+    to ensure dtype consistency between BF16 and FP16.
+    """
+    try:
+      import torchtune.modules.kv_cache as kv_cache_module
+      import types
+      from functools import wraps
+      
+      # Check if we should force FP16
+      force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "False").lower() == "true")
+      
+      if not force_fp16:
+        if DEBUG >= 2:
+          print("TORCH_FORCE_FP16 is not enabled, skipping KV cache patch")
+        return
+      
+      if DEBUG >= 1:
+        print("Applying global KV cache patch for FP16 compatibility")
+      
+      # Get the original update method from the KVCache class
+      original_update = kv_cache_module.KVCache.update
+      
+      # Create a patched update method
+      @wraps(original_update)
+      def patched_update(self, k_val, v_val):
+        try:
+          # Check dtypes
+          if hasattr(self, 'k_cache') and k_val.dtype != self.k_cache.dtype:
+            if DEBUG >= 2:
+              print(f"Converting k_val from {k_val.dtype} to {self.k_cache.dtype}")
+            k_val = k_val.to(dtype=self.k_cache.dtype)
+          
+          if hasattr(self, 'v_cache') and v_val.dtype != self.v_cache.dtype:
+            if DEBUG >= 2:
+              print(f"Converting v_val from {v_val.dtype} to {self.v_cache.dtype}")
+            v_val = v_val.to(dtype=self.v_cache.dtype)
+          
+          # Try the original update
+          return original_update(self, k_val, v_val)
+        except RuntimeError as e:
+          if "dtype mismatch" in str(e) or "Index put requires the source and destination dtypes match" in str(e):
+            # Emergency conversion to FP16
+            if DEBUG >= 1:
+              print(f"KV cache update error: {e}")
+              print("Performing emergency conversion to FP16")
+            
+            # Convert everything to FP16
+            k_val = k_val.to(dtype=torch.float16)
+            v_val = v_val.to(dtype=torch.float16)
+            
+            if hasattr(self, 'k_cache'):
+              self.k_cache = self.k_cache.to(dtype=torch.float16)
+            if hasattr(self, 'v_cache'):
+              self.v_cache = self.v_cache.to(dtype=torch.float16)
+            
+            # Try again with everything in FP16
+            return original_update(self, k_val, v_val)
+          else:
+            # Re-raise if it's not a dtype mismatch error
+            raise
+      
+      # Replace the original update method with our patched version
+      kv_cache_module.KVCache.update = patched_update
+      
+      if DEBUG >= 1:
+        print("Successfully applied global KV cache patch")
+    
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"Error applying global KV cache patch: {e}")
     
     # Performance settings
     self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
