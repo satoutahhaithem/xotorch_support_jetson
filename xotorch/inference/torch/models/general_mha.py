@@ -3,6 +3,7 @@ GeneralMHA class
 Return transformer model with MHA
 """
 from typing import Optional, Tuple
+import os
 
 import torch
 import torch.nn as nn
@@ -147,7 +148,7 @@ class ShardedGeneralModel(nn.Module):
     config: dict,
     shard: Shard,
     device: Optional[torch.device] = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = None,
     use_cache: Optional[bool] = False,
     max_generated_tokens: int = 1024
   ):
@@ -155,11 +156,26 @@ class ShardedGeneralModel(nn.Module):
 
     self.shard = shard
     self.config = config
-    self.dtype = dtype
+    
+    # Check if we should force FP16
+    force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "False").lower() == "true")
+    
+    # Determine the appropriate dtype
+    if dtype is None:
+      if force_fp16 and (device is not None and device.type == 'cuda'):
+        self.dtype = torch.float16
+        if DEBUG >= 2:
+          print(f"Forcing FP16 for model weights")
+      else:
+        self.dtype = torch.bfloat16
+    else:
+      self.dtype = dtype
+    
     self.device = device if device is not None else torch.device("cpu")
     self.max_seq_len = self.config["max_seq_len"]
     self.use_cache = use_cache
     
+    # Create the model with the determined dtype
     self.model = GeneralMHA(
       config,
       self.shard
@@ -167,6 +183,12 @@ class ShardedGeneralModel(nn.Module):
       dtype=self.dtype,
       device=self.device
     )
+    
+    # Ensure KV cache uses the same dtype
+    if hasattr(self.model, 'caches_are_enabled') and self.model.caches_are_enabled():
+      if DEBUG >= 3:
+        print(f"Resetting KV cache with dtype: {self.dtype}")
+      self.model.reset_caches()
 
     if DEBUG >= 4:
       print("ShardedGeneralModel called")

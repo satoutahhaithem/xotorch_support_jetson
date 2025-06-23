@@ -148,20 +148,31 @@ def load_model_weights_torchtune(
   if head_dim is None:
     head_dim = dim // num_heads
 
+  # Check if we should force FP16
+  force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "False").lower() == "true")
+  if force_fp16 and DEBUG >= 2:
+    print(f"Forcing FP16 for model weights during loading")
+
   model_state_dict = model.state_dict()
   if DEBUG >= 8:
     for name, _ in model_state_dict.items():
       print(f"name {name}")
+  
   # Load weights from safetensors files in the cache directory
   safetensors_files = list(cache_dir.glob("*.safetensors"))
   if not safetensors_files:
     raise FileNotFoundError("No safetensors files found in the cache directory.")
 
   # Load weights from each found safetensors file
-
   full_state_dict = {}
   for safetensor_file in safetensors_files:
     state_dict = load_safetensors(safetensor_file)
+    
+    # Convert weights to FP16 if needed
+    if force_fp16:
+      for key, tensor in state_dict.items():
+        if tensor.dtype == torch.bfloat16:
+          state_dict[key] = tensor.to(dtype=torch.float16)
 
     if full_state_dict is not None:
       full_state_dict = full_state_dict | state_dict
@@ -278,6 +289,14 @@ def load_model_weights_torchtune(
 
     # load new weight map
     model.load_state_dict(remapped_state_dict, strict=False)
+
+    # Convert model parameters to FP16 if needed
+    if force_fp16:
+      for name, param in model.named_parameters():
+        if param.dtype == torch.bfloat16:
+          param.data = param.data.to(dtype=torch.float16)
+          if DEBUG >= 3:
+            print(f"Converted {name} from BF16 to FP16")
 
     if DEBUG >= 8:
       print("\n--- checking weights ----\n")
