@@ -189,6 +189,52 @@ class ShardedGeneralModel(nn.Module):
       if DEBUG >= 3:
         print(f"Resetting KV cache with dtype: {self.dtype}")
       self.model.reset_caches()
+    
+    # Apply monkey patch to fix dtype mismatch in KV cache
+    if force_fp16 and self.device.type == 'cuda':
+      self._patch_kv_cache_for_fp16()
+      if DEBUG >= 2:
+        print("Applied FP16 patch to KV cache")
+        
+  def _patch_kv_cache_for_fp16(self):
+    """
+    Monkey patch the KV cache update method to ensure dtype consistency.
+    This is needed because the torchtune library's KV cache might use BF16
+    while our model is using FP16, causing dtype mismatches.
+    """
+    import types
+    from functools import wraps
+    
+    # Find all attention layers with KV cache
+    for name, module in self.model.named_modules():
+      if hasattr(module, 'kv_cache') and hasattr(module.kv_cache, 'update'):
+        original_update = module.kv_cache.update
+        
+        # Create a wrapper that ensures dtype consistency
+        @wraps(original_update)
+        def patched_update(self, k_val, v_val):
+          # Convert inputs to match cache dtype if needed
+          k_cache_dtype = self.k_cache.dtype
+          v_cache_dtype = self.v_cache.dtype
+          
+          if k_val.dtype != k_cache_dtype:
+            if DEBUG >= 3:
+              print(f"Converting k_val from {k_val.dtype} to {k_cache_dtype}")
+            k_val = k_val.to(dtype=k_cache_dtype)
+            
+          if v_val.dtype != v_cache_dtype:
+            if DEBUG >= 3:
+              print(f"Converting v_val from {v_val.dtype} to {v_cache_dtype}")
+            v_val = v_val.to(dtype=v_cache_dtype)
+            
+          # Call the original update method with dtype-matched tensors
+          return original_update(k_val, v_val)
+        
+        # Replace the original update method with our patched version
+        module.kv_cache.update = types.MethodType(patched_update, module.kv_cache)
+        
+        if DEBUG >= 3:
+          print(f"Patched KV cache in {name}")
 
     if DEBUG >= 4:
       print("ShardedGeneralModel called")
