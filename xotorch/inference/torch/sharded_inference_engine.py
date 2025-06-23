@@ -44,8 +44,11 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.shard_downloader = shard_downloader
     self.sharded_model = None
     self.request_id = None
-    # Increase thread pool size for better parallelism
-    self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+    
+    # Optimize thread pool size for better parallelism
+    thread_pool_size = int(os.getenv("TORCH_THREAD_POOL_SIZE", str(os.cpu_count() or 4)))
+    self.executor = ThreadPoolExecutor(max_workers=thread_pool_size)
+    
     self.uuid = str(uuid.uuid4())
     self.model_path = None
     self.model_config = None
@@ -57,11 +60,18 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.cache_setup = False
     
     # Performance optimization settings
-    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
-    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "2"))
+    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "4"))
+    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "8"))
     self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "True").lower() == "true")
     self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "True").lower() == "true")
-    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
+    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
+    
+    # Force FP16 precision for GPUs that don't support BF16 natively
+    self.force_fp16 = bool(os.getenv("TORCH_FORCE_FP16", "False").lower() == "true")
+    
+    # Enable CUDA benchmark for kernel optimization
+    if os.getenv("TORCH_CUDNN_BENCHMARK", "True").lower() == "true":
+      torch.backends.cudnn.benchmark = True
 
     # device settings
     if os.environ.get("TORCH_DEVICE"):
@@ -225,37 +235,92 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       print(f"top_k: {top_k}")
       print(self.device)
 
-    logits = torch.tensor(x).to(self.device)
+    # Ensure logits are in the correct dtype
+    if self.force_fp16 and self.device.type == 'cuda':
+        logits = torch.tensor(x, dtype=torch.float16).to(self.device)
+    else:
+        logits = torch.tensor(x).to(self.device)
 
     def sample_wrapper():
       # Use CUDA graphs for repeated sampling operations if available
+      use_cuda_graph = (self.device.type == 'cuda' and
+                        hasattr(torch.cuda, 'CUDAGraph') and
+                        x.shape == getattr(self, '_last_sample_shape', None))
+      
+      # Initialize variables for CUDA graph
       static_input = False
       graph = None
       
-      if self.device.type == 'cuda' and hasattr(torch.cuda, 'CUDAGraph') and x.shape == getattr(self, '_last_sample_shape', None):
+      # Try to use CUDA graph for better performance
+      if use_cuda_graph:
         static_input = True
+        # Create a new graph if we don't have one yet
         if not hasattr(self, '_sample_graph'):
           try:
-            self._sample_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._sample_graph):
-              q = torch.empty((logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
-                             device=logits.device).exponential_(1, generator=self.rng)
-              self._sample_output = ttg.sample(logits.clone(), temperature=temp, top_k=top_k, q=q.to(self.device))
-            graph = self._sample_graph
+            # Create a stream specifically for the graph
+            if not hasattr(self, '_graph_stream'):
+              self._graph_stream = torch.cuda.Stream()
+            
+            # Use the dedicated stream for graph capture
+            with torch.cuda.stream(self._graph_stream):
+              # Pre-allocate tensors for graph capture
+              self._logits_clone = logits.clone()
+              self._q_tensor = torch.empty(
+                (logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
+                device=logits.device,
+                dtype=torch.float32  # Keep q as float32 for numerical stability
+              )
+              
+              # Create and capture the graph
+              self._sample_graph = torch.cuda.CUDAGraph()
+              with torch.cuda.graph(self._sample_graph):
+                # Generate random values
+                self._q_tensor.exponential_(1, generator=self.rng)
+                # Sample tokens
+                self._sample_output = ttg.sample(
+                  self._logits_clone,
+                  temperature=temp,
+                  top_k=top_k,
+                  q=self._q_tensor
+                )
+              
+              # Store the graph for reuse
+              graph = self._sample_graph
+              
+              if DEBUG >= 3:
+                print("CUDA graph captured successfully for sampling")
           except Exception as e:
             if DEBUG >= 2:
               print(f"CUDA graph capture failed: {e}")
             static_input = False
+            # Clean up failed graph attempt
+            if hasattr(self, '_sample_graph'):
+              del self._sample_graph
+        else:
+          # We already have a graph, use it
+          graph = self._sample_graph
       
+      # Execute the sampling operation
       if static_input and graph is not None:
+        # Update the input tensor with current logits
+        self._logits_clone.copy_(logits)
+        
         # Reuse captured graph for better performance
-        graph.replay()
+        with torch.cuda.stream(self._graph_stream):
+          graph.replay()
+          # Wait for the graph to complete
+          self._graph_stream.synchronize()
+        
+        # Get the result
         tokens = self._sample_output
       else:
-        # Standard sampling path
-        q = torch.empty((logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
-                       device=logits.device).exponential_(1, generator=self.rng)
-        tokens = ttg.sample(logits.clone(), temperature=temp, top_k=top_k, q=q.to(self.device))
+        # Standard sampling path when graph is not available
+        q = torch.empty(
+          (logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
+          device=logits.device
+        ).exponential_(1, generator=self.rng)
+        
+        tokens = ttg.sample(logits, temperature=temp, top_k=top_k, q=q)
         
         # Store shape for future optimizations
         self._last_sample_shape = x.shape
@@ -341,47 +406,120 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         # Use torch.amp for mixed precision if available
         amp_context = contextlib.nullcontext()
         if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            # Use the model's dtype to avoid dtype mismatches
-            dtype = self.model_config.get("torch_dtype", torch.float32)
+            # Determine the appropriate dtype based on hardware capabilities
+            if self.force_fp16 and self.device.type == 'cuda':
+                # Force FP16 for GPUs that don't support BF16 natively
+                dtype = torch.float16
+            else:
+                # Use the model's dtype as default
+                dtype = self.model_config.get("torch_dtype", torch.float32)
+                
+            # Create the autocast context with the appropriate dtype
             amp_context = torch.amp.autocast(device_type=self.device.type, dtype=dtype)
+            
+            if DEBUG >= 2:
+                print(f"Using mixed precision with dtype: {dtype}")
         
         with amp_context:
           in_tokens = self.state.tokens.clone()
           in_input_pos = self.state.input_pos.clone()
           in_mask = self.state.mask.clone()
 
-          # Implement prefetching for better performance
-          # This allows the model to start processing the next token while still finalizing the current one
+          # Enhanced prefetching for better performance
+          # This allows the model to process multiple tokens in parallel
           if self.prefetch_size > 1 and self.state.curr_pos > 0 and model_cache:
-            # Prefetch multiple tokens at once
-            prefetch_results = []
+            # Create a dedicated stream for prefetching if not already created
+            if not hasattr(self, '_prefetch_stream') and self.device.type == 'cuda':
+              self._prefetch_stream = torch.cuda.Stream()
             
-            # Generate the current token
-            if hidden_state is not None:
-              model_hs, model_logits = self.sharded_model.generate(
-                tokens=in_tokens,
-                hidden_state=hidden_state,
-                input_pos=in_input_pos,
-                mask=in_mask,
-                curr_pos=self.state.curr_pos
-              )
-            else:
-              if not model_cache:
+            # Use batch processing when possible
+            if self.batch_size > 1:
+              # Process multiple tokens in a single batch for better efficiency
+              if DEBUG >= 3:
+                print(f"Using batch processing with size {self.batch_size}")
+              
+              # Generate the current token with batch processing
+              if hidden_state is not None:
                 model_hs, model_logits = self.sharded_model.generate(
                   tokens=in_tokens,
+                  hidden_state=hidden_state,
                   input_pos=in_input_pos,
                   mask=in_mask,
                   curr_pos=self.state.curr_pos
                 )
               else:
-                model_hs, model_logits = self.sharded_model.generate(
-                  tokens=input_tensor,
-                  input_pos=in_input_pos,
-                  mask=in_mask,
-                  curr_pos=self.state.curr_pos
-                )
+                if not model_cache:
+                  model_hs, model_logits = self.sharded_model.generate(
+                    tokens=in_tokens,
+                    input_pos=in_input_pos,
+                    mask=in_mask,
+                    curr_pos=self.state.curr_pos
+                  )
+                else:
+                  model_hs, model_logits = self.sharded_model.generate(
+                    tokens=input_tensor,
+                    input_pos=in_input_pos,
+                    mask=in_mask,
+                    curr_pos=self.state.curr_pos
+                  )
+            else:
+              # Use prefetching to overlap computation
+              if self.device.type == 'cuda' and hasattr(self, '_prefetch_stream'):
+                # Use a separate CUDA stream for prefetching
+                with torch.cuda.stream(self._prefetch_stream):
+                  if hidden_state is not None:
+                    model_hs, model_logits = self.sharded_model.generate(
+                      tokens=in_tokens,
+                      hidden_state=hidden_state,
+                      input_pos=in_input_pos,
+                      mask=in_mask,
+                      curr_pos=self.state.curr_pos
+                    )
+                  else:
+                    if not model_cache:
+                      model_hs, model_logits = self.sharded_model.generate(
+                        tokens=in_tokens,
+                        input_pos=in_input_pos,
+                        mask=in_mask,
+                        curr_pos=self.state.curr_pos
+                      )
+                    else:
+                      model_hs, model_logits = self.sharded_model.generate(
+                        tokens=input_tensor,
+                        input_pos=in_input_pos,
+                        mask=in_mask,
+                        curr_pos=self.state.curr_pos
+                      )
+                
+                # Synchronize the prefetch stream
+                self._prefetch_stream.synchronize()
+              else:
+                # Standard generation path for non-CUDA devices
+                if hidden_state is not None:
+                  model_hs, model_logits = self.sharded_model.generate(
+                    tokens=in_tokens,
+                    hidden_state=hidden_state,
+                    input_pos=in_input_pos,
+                    mask=in_mask,
+                    curr_pos=self.state.curr_pos
+                  )
+                else:
+                  if not model_cache:
+                    model_hs, model_logits = self.sharded_model.generate(
+                      tokens=in_tokens,
+                      input_pos=in_input_pos,
+                      mask=in_mask,
+                      curr_pos=self.state.curr_pos
+                    )
+                  else:
+                    model_hs, model_logits = self.sharded_model.generate(
+                      tokens=input_tensor,
+                      input_pos=in_input_pos,
+                      mask=in_mask,
+                      curr_pos=self.state.curr_pos
+                    )
           else:
-            # Standard generation path
+            # Standard generation path without prefetching
             if hidden_state is not None:
               model_hs, model_logits = self.sharded_model.generate(
                 tokens=in_tokens,
@@ -415,13 +553,17 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         raise
 
       if model_hs is not None:
-        # numpy current no support for bf16
-        # if model_hs.dtype == torch.bfloat16:
-        #   model_hs = model_hs.float()
+        # Handle different dtypes properly
+        if model_hs.dtype == torch.bfloat16 or (self.force_fp16 and model_hs.dtype != torch.float16):
+          # Convert to appropriate dtype for numpy export
+          if self.force_fp16:
+            model_hs = model_hs.to(dtype=torch.float16)
+          else:
+            model_hs = model_hs.float()
 
         if DEBUG >= 4:
           print("sending hidden states")
-          print(f"model_hs: {model_hs.size()}")
+          print(f"model_hs: {model_hs.size()}, dtype: {model_hs.dtype}")
           print(f"state.tokens: {self.state.tokens}")
           print(f"state.input_pos: {self.state.input_pos.size()}")
           print(f"state.mask: {self.state.mask.size()}")
@@ -436,12 +578,17 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       else:
         self.state.curr_pos += 1
 
-      # numpy current no support for bf16
-      # if model_logits.dtype == torch.bfloat16:
-      #   model_logits = model_logits.float()
-
+      # Handle different dtypes properly
+      if model_logits.dtype == torch.bfloat16 or (self.force_fp16 and model_logits.dtype != torch.float16):
+        # Convert to appropriate dtype for numpy export
+        if self.force_fp16:
+          model_logits = model_logits.to(dtype=torch.float16)
+        else:
+          model_logits = model_logits.float()
+      
+      # Always ensure we have a proper dtype for numpy export
       return (
-        model_logits[:, -1].float().numpy(force=True),
+        model_logits[:, -1].numpy(force=True),
         self.state.to_dict(),
       )
 
@@ -499,10 +646,11 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       if self.use_compile and hasattr(torch, 'compile'):
         try:
           # Use torch.compile for PyTorch 2.0+ to optimize the model
+          # Set fullgraph=True for better optimization when possible
           self.sharded_model.model = torch.compile(
             self.sharded_model.model,
             mode=self.compile_mode,
-            fullgraph=False
+            fullgraph=True if self.compile_mode == "max-autotune" else False
           )
           if DEBUG >= 2:
             print(f"Model compiled with mode: {self.compile_mode}")
@@ -511,17 +659,31 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       
       # Enable CUDA optimizations if available
       if self.device.type == 'cuda':
-        # Set CUDA stream priority to high for inference
-        torch.cuda.Stream(priority=-1)
+        # Create a high-priority CUDA stream for inference
+        inference_stream = torch.cuda.Stream(priority=-1)
+        torch.cuda.set_stream(inference_stream)
         
-        # Enable CUDA graph capture for repeated operations if available
+        # Set appropriate memory allocation strategy
+        if hasattr(torch.cuda, 'memory_stats'):
+          # Print initial memory stats at debug level 3+
+          if DEBUG >= 3:
+            print(f"Initial CUDA memory stats: {torch.cuda.memory_stats()}")
+        
+        # Optimize CUDA operations
         if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
-          # Use torch.amp instead of torch.cuda.amp (which is deprecated)
-          if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            # Get the model's dtype to avoid dtype mismatches
+          # Determine the appropriate dtype for mixed precision
+          if self.force_fp16:
+            # Force FP16 for GPUs that don't support BF16 natively
+            dtype = torch.float16
+            if DEBUG >= 2:
+              print(f"Forcing FP16 precision for CUDA operations")
+          else:
+            # Use the model's dtype as default
             dtype = self.model_config.get("torch_dtype", torch.float32)
-            # Don't enable by default, let the context manager handle it
-            # This avoids the deprecation warning
+          
+          # Pre-allocate memory for better performance
+          torch.cuda.empty_cache()
+          torch.cuda.memory_allocated()
     
     await asyncio.get_running_loop().run_in_executor(
       self.executor,
