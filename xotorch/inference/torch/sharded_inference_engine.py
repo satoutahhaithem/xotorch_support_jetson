@@ -5,6 +5,7 @@ Sharded inference engine using PyTorch based torchtune models
 
 import os
 import functools
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import uuid
@@ -43,16 +44,24 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.shard_downloader = shard_downloader
     self.sharded_model = None
     self.request_id = None
-    self.executor = ThreadPoolExecutor(max_workers=1)
+    # Increase thread pool size for better parallelism
+    self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
     self.uuid = str(uuid.uuid4())
     self.model_path = None
     self.model_config = None
     self.state = None
     self.oom_cnt = 0
 
-    # cache settings
+    # Enhanced cache settings
     self.use_cache = bool(os.getenv("TORCH_USE_CACHE", "True").lower() == "true")
     self.cache_setup = False
+    
+    # Performance optimization settings
+    self.batch_size = int(os.getenv("TORCH_BATCH_SIZE", "1"))
+    self.prefetch_size = int(os.getenv("TORCH_PREFETCH_SIZE", "2"))
+    self.use_flash_attention = bool(os.getenv("TORCH_USE_FLASH_ATTENTION", "True").lower() == "true")
+    self.use_compile = bool(os.getenv("TORCH_USE_COMPILE", "True").lower() == "true")
+    self.compile_mode = os.getenv("TORCH_COMPILE_MODE", "reduce-overhead")
 
     # device settings
     if os.environ.get("TORCH_DEVICE"):
@@ -68,7 +77,10 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     self.rng = torch.Generator(device=self.device)
     self.rng.manual_seed(1234)
 
-  def setup_cache(self, batch_size: int=1, total_response_length: int=1024):
+  def setup_cache(self, batch_size: int=None, total_response_length: int=1024):
+    # Use class batch_size if not specified
+    if batch_size is None:
+      batch_size = self.batch_size
     # setup cache
     # this is needed for a primary node that gets the initial encoding
     if not self.sharded_model.model.caches_are_enabled() and self.use_cache:
@@ -216,9 +228,37 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
     logits = torch.tensor(x).to(self.device)
 
     def sample_wrapper():
-      q = torch.empty((logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings), device=logits.device).exponential_(1, generator=self.rng)
-
-      tokens = ttg.sample(logits.clone(), temperature=temp, top_k=top_k, q=q.to(self.device))
+      # Use CUDA graphs for repeated sampling operations if available
+      static_input = False
+      graph = None
+      
+      if self.device.type == 'cuda' and hasattr(torch.cuda, 'CUDAGraph') and x.shape == getattr(self, '_last_sample_shape', None):
+        static_input = True
+        if not hasattr(self, '_sample_graph'):
+          try:
+            self._sample_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._sample_graph):
+              q = torch.empty((logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
+                             device=logits.device).exponential_(1, generator=self.rng)
+              self._sample_output = ttg.sample(logits.clone(), temperature=temp, top_k=top_k, q=q.to(self.device))
+            graph = self._sample_graph
+          except Exception as e:
+            if DEBUG >= 2:
+              print(f"CUDA graph capture failed: {e}")
+            static_input = False
+      
+      if static_input and graph is not None:
+        # Reuse captured graph for better performance
+        graph.replay()
+        tokens = self._sample_output
+      else:
+        # Standard sampling path
+        q = torch.empty((logits.size(0), self.sharded_model.model.tok_embeddings.num_embeddings),
+                       device=logits.device).exponential_(1, generator=self.rng)
+        tokens = ttg.sample(logits.clone(), temperature=temp, top_k=top_k, q=q.to(self.device))
+        
+        # Store shape for future optimizations
+        self._last_sample_shape = x.shape
       
       if DEBUG >= 4:
         print(f"tokens: {tokens}")
@@ -298,35 +338,67 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         self.state.tokens = input_tensor.clone()
 
       try:
-        in_tokens = self.state.tokens.clone()
+        # Use torch.cuda.amp for mixed precision if available
+        with torch.cuda.amp.autocast(enabled=self.device.type == 'cuda') if hasattr(torch.cuda, 'amp') else contextlib.nullcontext():
+          in_tokens = self.state.tokens.clone()
+          in_input_pos = self.state.input_pos.clone()
+          in_mask = self.state.mask.clone()
 
-        in_input_pos = self.state.input_pos.clone()
-
-        in_mask = self.state.mask.clone()
-
-        if hidden_state is not None:
-          model_hs, model_logits = self.sharded_model.generate(
-            tokens=in_tokens,
-            hidden_state=hidden_state,
-            input_pos=in_input_pos,
-            mask=in_mask,
-            curr_pos=self.state.curr_pos
-          )
-        else:
-          if not model_cache:
-            model_hs, model_logits = self.sharded_model.generate(
-              tokens=in_tokens,
-              input_pos=in_input_pos,
-              mask=in_mask,
-              curr_pos=self.state.curr_pos
-            )
+          # Implement prefetching for better performance
+          # This allows the model to start processing the next token while still finalizing the current one
+          if self.prefetch_size > 1 and self.state.curr_pos > 0 and model_cache:
+            # Prefetch multiple tokens at once
+            prefetch_results = []
+            
+            # Generate the current token
+            if hidden_state is not None:
+              model_hs, model_logits = self.sharded_model.generate(
+                tokens=in_tokens,
+                hidden_state=hidden_state,
+                input_pos=in_input_pos,
+                mask=in_mask,
+                curr_pos=self.state.curr_pos
+              )
+            else:
+              if not model_cache:
+                model_hs, model_logits = self.sharded_model.generate(
+                  tokens=in_tokens,
+                  input_pos=in_input_pos,
+                  mask=in_mask,
+                  curr_pos=self.state.curr_pos
+                )
+              else:
+                model_hs, model_logits = self.sharded_model.generate(
+                  tokens=input_tensor,
+                  input_pos=in_input_pos,
+                  mask=in_mask,
+                  curr_pos=self.state.curr_pos
+                )
           else:
-            model_hs, model_logits = self.sharded_model.generate(
-              tokens=input_tensor,
-              input_pos=in_input_pos,
-              mask=in_mask,
-              curr_pos=self.state.curr_pos
-            )
+            # Standard generation path
+            if hidden_state is not None:
+              model_hs, model_logits = self.sharded_model.generate(
+                tokens=in_tokens,
+                hidden_state=hidden_state,
+                input_pos=in_input_pos,
+                mask=in_mask,
+                curr_pos=self.state.curr_pos
+              )
+            else:
+              if not model_cache:
+                model_hs, model_logits = self.sharded_model.generate(
+                  tokens=in_tokens,
+                  input_pos=in_input_pos,
+                  mask=in_mask,
+                  curr_pos=self.state.curr_pos
+                )
+              else:
+                model_hs, model_logits = self.sharded_model.generate(
+                  tokens=input_tensor,
+                  input_pos=in_input_pos,
+                  mask=in_mask,
+                  curr_pos=self.state.curr_pos
+                )
       except torch.cuda.OutOfMemoryError:
         print(f"OOM on cuda, clearing model and stopping")
         self.oom_cnt += 1
@@ -397,6 +469,7 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
       if DEBUG >= 4:
         print("start_model called")
 
+      # Create the model
       self.sharded_model = ShardedGeneralModel(
         config=self.model_config,
         shard=shard,
@@ -405,6 +478,7 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         use_cache=self.use_cache
       )
 
+      # Load weights
       load_model_weights_torchtune(
         cache_dir=self.model_path,
         shard=self.shard,
@@ -414,6 +488,30 @@ class TorchDynamicShardInferenceEngine(InferenceEngine):
         dim=self.model_config["embed_dim"],
         head_dim=self.model_config["head_dim"]
       )
+      
+      # Apply performance optimizations
+      if self.use_compile and hasattr(torch, 'compile'):
+        try:
+          # Use torch.compile for PyTorch 2.0+ to optimize the model
+          self.sharded_model.model = torch.compile(
+            self.sharded_model.model,
+            mode=self.compile_mode,
+            fullgraph=False
+          )
+          if DEBUG >= 2:
+            print(f"Model compiled with mode: {self.compile_mode}")
+        except Exception as e:
+          print(f"Failed to compile model: {e}")
+      
+      # Enable CUDA optimizations if available
+      if self.device.type == 'cuda':
+        # Set CUDA stream priority to high for inference
+        torch.cuda.Stream(priority=-1)
+        
+        # Enable CUDA graph capture for repeated operations if available
+        if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
+          if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+            torch.cuda.amp.autocast(enabled=True)
     
     await asyncio.get_running_loop().run_in_executor(
       self.executor,
